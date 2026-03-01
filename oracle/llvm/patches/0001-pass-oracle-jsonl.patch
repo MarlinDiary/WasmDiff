@@ -1,0 +1,542 @@
+diff --git a/llvm/include/llvm/Passes/StandardInstrumentations.h b/llvm/include/llvm/Passes/StandardInstrumentations.h
+index 4ee5ab255..fc2db1fc5 100644
+--- a/llvm/include/llvm/Passes/StandardInstrumentations.h
++++ b/llvm/include/llvm/Passes/StandardInstrumentations.h
+@@ -32,6 +32,7 @@
+ #include "llvm/Transforms/IPO/SampleProfileProbe.h"
+ 
+ #include <string>
++#include <memory>
+ #include <utility>
+ 
+ namespace llvm {
+@@ -41,6 +42,22 @@ class Function;
+ class MachineFunction;
+ class PassInstrumentationCallbacks;
+ 
++/// Pass-level structured oracle for IR changes.
++///
++/// When enabled (via LLVM command-line options), this instrumentation records
++/// per-pass before/after summaries and emits machine-readable JSONL suitable
++/// for automated attribution.
++class PassOracleInstrumentation {
++  struct Impl;
++  std::unique_ptr<Impl> P;
++
++public:
++  LLVM_ABI PassOracleInstrumentation();
++  LLVM_ABI ~PassOracleInstrumentation();
++
++  LLVM_ABI void registerCallbacks(PassInstrumentationCallbacks &PIC);
++};
++
+ /// Instrumentation to print IR before/after passes.
+ ///
+ /// Needs state to be able to print module after pass that invalidates IR unit
+@@ -597,6 +614,7 @@ private:
+ /// This class provides an interface to register all the standard pass
+ /// instrumentations and manages their state (if any).
+ class StandardInstrumentations {
++  PassOracleInstrumentation PassOracle;
+   PrintIRInstrumentation PrintIR;
+   PrintPassInstrumentation PrintPass;
+   TimePassesHandler TimePasses;
+diff --git a/llvm/lib/Passes/StandardInstrumentations.cpp b/llvm/lib/Passes/StandardInstrumentations.cpp
+index 0623e6677..53b5adb40 100644
+--- a/llvm/lib/Passes/StandardInstrumentations.cpp
++++ b/llvm/lib/Passes/StandardInstrumentations.cpp
+@@ -14,7 +14,9 @@
+ 
+ #include "llvm/Passes/StandardInstrumentations.h"
+ #include "llvm/ADT/Any.h"
++#include "llvm/ADT/DenseSet.h"
+ #include "llvm/ADT/StringRef.h"
++#include "llvm/ADT/StringMap.h"
+ #include "llvm/Analysis/LazyCallGraph.h"
+ #include "llvm/Analysis/LoopInfo.h"
+ #include "llvm/CodeGen/MIRPrinter.h"
+@@ -22,7 +24,10 @@
+ #include "llvm/CodeGen/MachineModuleInfo.h"
+ #include "llvm/CodeGen/MachineVerifier.h"
+ #include "llvm/IR/Constants.h"
++#include "llvm/IR/DebugInfoMetadata.h"
++#include "llvm/IR/DebugLoc.h"
+ #include "llvm/IR/Function.h"
++#include "llvm/IR/Instructions.h"
+ #include "llvm/IR/Module.h"
+ #include "llvm/IR/PassInstrumentation.h"
+ #include "llvm/IR/PassManager.h"
+@@ -32,14 +37,17 @@
+ #include "llvm/Support/CommandLine.h"
+ #include "llvm/Support/Debug.h"
+ #include "llvm/Support/Error.h"
++#include "llvm/Support/FileSystem.h"
+ #include "llvm/Support/FormatVariadic.h"
+ #include "llvm/Support/GraphWriter.h"
++#include "llvm/Support/JSON.h"
+ #include "llvm/Support/Path.h"
+ #include "llvm/Support/Program.h"
+ #include "llvm/Support/Regex.h"
+ #include "llvm/Support/Signals.h"
+ #include "llvm/Support/raw_ostream.h"
+ #include "llvm/Support/xxhash.h"
++#include <mutex>
+ #include <unordered_map>
+ #include <unordered_set>
+ #include <utility>
+@@ -140,6 +148,12 @@ static cl::opt<bool>
+                     cl::desc("Dump dropped debug variables stats"),
+                     cl::init(false));
+ 
++// Pass-oracle: structured per-pass IR deltas (JSONL).
++static cl::opt<std::string> PassOraclePath(
++    "pass-oracle",
++    cl::desc("Write pass-level IR change summaries as JSONL to this path"),
++    cl::Hidden, cl::init(""), cl::value_desc("filename"));
++
+ template <typename IRUnitT> static const IRUnitT *unwrapIR(Any IR) {
+   const IRUnitT **IRPtr = llvm::any_cast<const IRUnitT *>(&IR);
+   return IRPtr ? *IRPtr : nullptr;
+@@ -2434,6 +2448,434 @@ void DotCfgChangeReporter::registerCallbacks(
+   }
+ }
+ 
++namespace {
++
++struct PassOracleLocCounts {
++  uint32_t Inst = 0;
++  uint32_t Call = 0;
++  uint32_t Br = 0;
++  uint32_t ConstOp = 0;
++  uint32_t Alloca = 0;
++  uint32_t Load = 0;
++  uint32_t Store = 0;
++
++  bool operator==(const PassOracleLocCounts &O) const {
++    return Inst == O.Inst && Call == O.Call && Br == O.Br &&
++           ConstOp == O.ConstOp && Alloca == O.Alloca && Load == O.Load &&
++           Store == O.Store;
++  }
++  bool operator!=(const PassOracleLocCounts &O) const { return !(*this == O); }
++};
++
++struct PassOracleFuncSummary {
++  stable_hash Hash = 0;
++  uint64_t Inst = 0;
++  uint64_t Call = 0;
++  uint64_t Br = 0;
++  uint64_t ConstOp = 0;
++  uint64_t Alloca = 0;
++  uint64_t Load = 0;
++  uint64_t Store = 0;
++  uint64_t DbgLocInst = 0;
++  uint64_t DbgLocUnique = 0;
++
++  DenseMap<const DILocation *, PassOracleLocCounts> Locs;
++};
++
++static uint32_t countConstOperands(const Instruction &I) {
++  uint32_t C = 0;
++  for (const Use &U : I.operands()) {
++    if (isa<ConstantInt>(U) || isa<ConstantFP>(U))
++      ++C;
++  }
++  return C;
++}
++
++static bool isBranchLike(const Instruction &I) {
++  return isa<BranchInst>(&I) || isa<SwitchInst>(&I) || isa<IndirectBrInst>(&I) ||
++         isa<InvokeInst>(&I) || isa<CallBrInst>(&I) || isa<SelectInst>(&I);
++}
++
++static std::string filePathForLoc(const DILocation &Loc) {
++  const DIFile *F = Loc.getFile();
++  if (!F)
++    return "";
++  SmallString<256> P(F->getDirectory());
++  sys::path::append(P, F->getFilename());
++  return std::string(P);
++}
++
++static std::string hexStableHash(stable_hash H) {
++  // formatv's X specifier already includes the 0x prefix.
++  return formatv("{0:X16}", uint64_t(H)).str();
++}
++
++} // namespace
++
++struct PassOracleInstrumentation::Impl {
++  struct StackEntry {
++    std::string PassID;
++    std::string PassName;
++    std::string IRName;
++    StringMap<PassOracleFuncSummary> Before;
++  };
++
++  std::mutex Mu;
++  std::unique_ptr<raw_fd_ostream> Out;
++  SmallVector<StackEntry, 8> Stack;
++
++  void ensureOpen() {
++    if (Out)
++      return;
++    std::error_code EC;
++    Out = std::make_unique<raw_fd_ostream>(PassOraclePath, EC,
++                                           sys::fs::OpenFlags::OF_Append);
++    if (EC)
++      report_fatal_error(errorCodeToError(EC));
++  }
++
++  static bool shouldTrackFunction(const Function &F) {
++    // Keep this oracle independent of -filter-print-funcs / PrintIR filters:
++    // we want full coverage of IR changes.
++    return !F.isDeclaration();
++  }
++
++  static PassOracleFuncSummary summarizeFunction(const Function &F) {
++    PassOracleFuncSummary S;
++    S.Hash = StructuralHash(F, /*DetailedHash=*/true);
++
++    DenseSet<const DILocation *> UniqueLocs;
++
++    for (const BasicBlock &BB : F) {
++      for (const Instruction &I : BB) {
++        ++S.Inst;
++        const bool IsCall = isa<CallBase>(&I);
++        const bool IsBr = isBranchLike(I);
++        const bool IsAlloca = isa<AllocaInst>(&I);
++        const bool IsLoad = isa<LoadInst>(&I);
++        const bool IsStore = isa<StoreInst>(&I);
++        const uint32_t ConstOps = countConstOperands(I);
++
++        if (IsCall)
++          ++S.Call;
++        if (IsBr)
++          ++S.Br;
++        if (IsAlloca)
++          ++S.Alloca;
++        if (IsLoad)
++          ++S.Load;
++        if (IsStore)
++          ++S.Store;
++        S.ConstOp += ConstOps;
++
++        const DILocation *StrictLoc = nullptr;
++        if (DebugLoc DL = I.getDebugLoc()) {
++          ++S.DbgLocInst;
++          StrictLoc = DL.get();
++          UniqueLocs.insert(StrictLoc);
++        }
++
++        const DILocation *LocForCount = StrictLoc;
++        if (LocForCount) {
++          PassOracleLocCounts &LC = S.Locs[LocForCount];
++          ++LC.Inst;
++          if (IsCall)
++            ++LC.Call;
++          if (IsBr)
++            ++LC.Br;
++          if (IsAlloca)
++            ++LC.Alloca;
++          if (IsLoad)
++            ++LC.Load;
++          if (IsStore)
++            ++LC.Store;
++          LC.ConstOp += ConstOps;
++        }
++      }
++    }
++
++    S.DbgLocUnique = UniqueLocs.size();
++    return S;
++  }
++
++  static json::Object toJSON(const PassOracleFuncSummary &S) {
++    json::Object O;
++    O["hash"] = hexStableHash(S.Hash);
++    O["inst"] = S.Inst;
++    O["call"] = S.Call;
++    O["br"] = S.Br;
++    O["const_op"] = S.ConstOp;
++    O["alloca"] = S.Alloca;
++    O["load"] = S.Load;
++    O["store"] = S.Store;
++    O["dbg_loc_inst"] = S.DbgLocInst;
++    O["dbg_loc_unique"] = S.DbgLocUnique;
++    return O;
++  }
++
++  static json::Object deltaJSON(const PassOracleFuncSummary &B,
++                                const PassOracleFuncSummary &A) {
++    json::Object D;
++    D["inst"] = int64_t(A.Inst) - int64_t(B.Inst);
++    D["call"] = int64_t(A.Call) - int64_t(B.Call);
++    D["br"] = int64_t(A.Br) - int64_t(B.Br);
++    D["const_op"] = int64_t(A.ConstOp) - int64_t(B.ConstOp);
++    D["alloca"] = int64_t(A.Alloca) - int64_t(B.Alloca);
++    D["load"] = int64_t(A.Load) - int64_t(B.Load);
++    D["store"] = int64_t(A.Store) - int64_t(B.Store);
++    D["dbg_loc_inst"] = int64_t(A.DbgLocInst) - int64_t(B.DbgLocInst);
++    D["dbg_loc_unique"] = int64_t(A.DbgLocUnique) - int64_t(B.DbgLocUnique);
++    return D;
++  }
++
++  static bool isUnchanged(const PassOracleFuncSummary &B,
++                          const PassOracleFuncSummary &A) {
++    return B.Hash == A.Hash && B.Inst == A.Inst && B.Call == A.Call &&
++           B.Br == A.Br && B.ConstOp == A.ConstOp && B.Alloca == A.Alloca &&
++           B.Load == A.Load && B.Store == A.Store &&
++           B.DbgLocInst == A.DbgLocInst && B.DbgLocUnique == A.DbgLocUnique;
++  }
++
++  static bool shouldIgnorePass(StringRef PassID) { return isIgnored(PassID); }
++
++  void collectFunctions(Any IR, SmallVector<const Function *, 8> &Funcs) const {
++    if (const auto *M = unwrapIR<Module>(IR)) {
++      for (const Function &F : M->functions())
++        if (shouldTrackFunction(F))
++          Funcs.push_back(&F);
++      return;
++    }
++    if (const auto *F = unwrapIR<Function>(IR)) {
++      if (shouldTrackFunction(*F))
++        Funcs.push_back(F);
++      return;
++    }
++    if (const auto *C = unwrapIR<LazyCallGraph::SCC>(IR)) {
++      for (const LazyCallGraph::Node &N : *C) {
++        const Function &F = N.getFunction();
++        if (shouldTrackFunction(F))
++          Funcs.push_back(&F);
++      }
++      return;
++    }
++    if (const auto *L = unwrapIR<Loop>(IR)) {
++      const Function *F = L->getHeader()->getParent();
++      if (F && shouldTrackFunction(*F))
++        Funcs.push_back(F);
++      return;
++    }
++    // Ignore MachineFunction and any unknown IR units for now.
++  }
++
++  void emitFunctionRecord(const Module &M, StringRef FuncName,
++                          const PassOracleFuncSummary *Before,
++                          const PassOracleFuncSummary *After,
++                          const StackEntry &E) {
++    json::Object R;
++    R["kind"] = "pass_oracle";
++    R["module"] = M.getModuleIdentifier();
++    R["pass_id"] = E.PassID;
++    R["pass_name"] = E.PassName;
++    R["ir"] = E.IRName;
++    R["function"] = FuncName;
++
++    if (Before)
++      R["before"] = toJSON(*Before);
++    else
++      R["before"] = nullptr;
++
++    if (After)
++      R["after"] = toJSON(*After);
++    else
++      R["after"] = nullptr;
++
++    if (Before && After)
++      R["delta"] = deltaJSON(*Before, *After);
++
++    if (Before || After) {
++      PassOracleFuncSummary Empty;
++      const PassOracleFuncSummary *B0 = Before ? Before : &Empty;
++      const PassOracleFuncSummary *A0 = After ? After : &Empty;
++
++      DenseSet<const DILocation *> Keys;
++      Keys.reserve(B0->Locs.size() + A0->Locs.size());
++      for (const auto &KV : B0->Locs)
++        Keys.insert(KV.first);
++      for (const auto &KV : A0->Locs)
++        Keys.insert(KV.first);
++
++      struct LocDelta {
++        const DILocation *Loc = nullptr;
++        int64_t Inst = 0;
++        int64_t Call = 0;
++        int64_t Br = 0;
++        int64_t ConstOp = 0;
++        int64_t Alloca = 0;
++        int64_t Load = 0;
++        int64_t Store = 0;
++        uint64_t Score = 0;
++      };
++
++      SmallVector<LocDelta, 32> Deltas;
++      Deltas.reserve(Keys.size());
++
++      auto getCounts = [](const DenseMap<const DILocation *, PassOracleLocCounts>
++                              &Map,
++                          const DILocation *Loc) -> PassOracleLocCounts {
++        auto It = Map.find(Loc);
++        return It == Map.end() ? PassOracleLocCounts{} : It->second;
++      };
++
++      for (const DILocation *Loc : Keys) {
++        const PassOracleLocCounts B = getCounts(B0->Locs, Loc);
++        const PassOracleLocCounts A = getCounts(A0->Locs, Loc);
++        if (B == A)
++          continue;
++
++        LocDelta LD;
++        LD.Loc = Loc;
++        LD.Inst = int64_t(A.Inst) - int64_t(B.Inst);
++        LD.Call = int64_t(A.Call) - int64_t(B.Call);
++        LD.Br = int64_t(A.Br) - int64_t(B.Br);
++        LD.ConstOp = int64_t(A.ConstOp) - int64_t(B.ConstOp);
++        LD.Alloca = int64_t(A.Alloca) - int64_t(B.Alloca);
++        LD.Load = int64_t(A.Load) - int64_t(B.Load);
++        LD.Store = int64_t(A.Store) - int64_t(B.Store);
++        auto abs64 = [](int64_t V) -> uint64_t {
++          return V < 0 ? uint64_t(-V) : uint64_t(V);
++        };
++        LD.Score = abs64(LD.Inst) + 16ull * abs64(LD.Call) +
++                   4ull * abs64(LD.Br);
++
++        Deltas.push_back(LD);
++      }
++
++      llvm::sort(Deltas, [](const LocDelta &X, const LocDelta &Y) {
++        if (X.Score != Y.Score)
++          return X.Score > Y.Score;
++        return X.Loc < Y.Loc;
++      });
++
++      json::Array A;
++      A.reserve(Deltas.size());
++      for (const LocDelta &LD : Deltas) {
++        json::Object L;
++        L["file"] = filePathForLoc(*LD.Loc);
++        L["line"] = int64_t(LD.Loc->getLine());
++        L["col"] = int64_t(LD.Loc->getColumn());
++        L["d_inst"] = LD.Inst;
++        L["d_call"] = LD.Call;
++        L["d_br"] = LD.Br;
++        L["d_const_op"] = LD.ConstOp;
++        L["d_alloca"] = LD.Alloca;
++        L["d_load"] = LD.Load;
++        L["d_store"] = LD.Store;
++        A.push_back(std::move(L));
++      }
++      R["loc_deltas"] = std::move(A);
++    }
++
++    std::lock_guard<std::mutex> Lock(Mu);
++    ensureOpen();
++    *Out << json::Value(std::move(R)) << "\n";
++  }
++
++  void handleBefore(StringRef PassID, StringRef PassName, Any IR) {
++    StackEntry E;
++    E.PassID = PassID.str();
++    E.PassName = PassName.str();
++    E.IRName = getIRName(IR);
++
++    if (shouldIgnorePass(PassID)) {
++      Stack.push_back(std::move(E));
++      return;
++    }
++
++    SmallVector<const Function *, 8> Funcs;
++    collectFunctions(IR, Funcs);
++    for (const Function *F : Funcs)
++      E.Before.insert(std::make_pair(F->getName(), summarizeFunction(*F)));
++
++    Stack.push_back(std::move(E));
++  }
++
++  void handleAfter(StringRef PassID, StringRef PassName, Any IR) {
++    (void)PassName;
++    if (Stack.empty())
++      return;
++
++    StackEntry E = std::move(Stack.back());
++    Stack.pop_back();
++
++    if (E.Before.empty())
++      return;
++
++    const Module *M = unwrapModule(IR, /*Force=*/true);
++    if (!M)
++      return;
++
++    SmallVector<const Function *, 8> Funcs;
++    collectFunctions(IR, Funcs);
++
++    StringSet<> Seen;
++    for (const Function *F : Funcs) {
++      const PassOracleFuncSummary After = summarizeFunction(*F);
++      const PassOracleFuncSummary *Before = nullptr;
++      if (auto It = E.Before.find(F->getName()); It != E.Before.end())
++        Before = &It->getValue();
++
++      const bool Changed =
++          Before ? !isUnchanged(*Before, After) : true /* added */;
++      if (Changed)
++        emitFunctionRecord(*M, F->getName(), Before, &After, E);
++
++      Seen.insert(F->getName());
++    }
++
++    // Removed functions.
++    for (const auto &KV : E.Before) {
++      StringRef Name = KV.getKey();
++      if (Seen.contains(Name))
++        continue;
++      emitFunctionRecord(*M, Name, &KV.getValue(), nullptr, E);
++    }
++  }
++
++  void handleInvalidated(StringRef PassID) {
++    if (Stack.empty())
++      return;
++    // Match ChangeReporter: always pop one stack entry.
++    Stack.pop_back();
++    (void)PassID;
++  }
++};
++
++PassOracleInstrumentation::PassOracleInstrumentation()
++    : P(std::make_unique<PassOracleInstrumentation::Impl>()) {}
++
++PassOracleInstrumentation::~PassOracleInstrumentation() = default;
++
++void PassOracleInstrumentation::registerCallbacks(
++    PassInstrumentationCallbacks &PIC) {
++  if (PassOraclePath.empty())
++    return;
++
++  PIC.registerBeforeNonSkippedPassCallback([this, &PIC](StringRef PassID,
++                                                        Any IR) {
++    P->handleBefore(PassID, PIC.getPassNameForClassName(PassID), IR);
++  });
++
++  PIC.registerAfterPassCallback(
++      [this, &PIC](StringRef PassID, Any IR, const PreservedAnalyses &) {
++        P->handleAfter(PassID, PIC.getPassNameForClassName(PassID), IR);
++      });
++
++  PIC.registerAfterPassInvalidatedCallback(
++      [this](StringRef PassID, const PreservedAnalyses &) {
++        P->handleInvalidated(PassID);
++      });
++}
++
+ StandardInstrumentations::StandardInstrumentations(
+     LLVMContext &Context, bool DebugLogging, bool VerifyEach,
+     PrintPassOptions PrintPassOpts)
+@@ -2508,6 +2950,7 @@ void PrintCrashIRInstrumentation::registerCallbacks(
+ 
+ void StandardInstrumentations::registerCallbacks(
+     PassInstrumentationCallbacks &PIC, ModuleAnalysisManager *MAM) {
++  PassOracle.registerCallbacks(PIC);
+   PrintIR.registerCallbacks(PIC);
+   PrintPass.registerCallbacks(PIC);
+   TimePasses.registerCallbacks(PIC);

@@ -1,0 +1,467 @@
+diff --git a/lld/wasm/CMakeLists.txt b/lld/wasm/CMakeLists.txt
+index 05b12d76d..5c9329e59 100644
+--- a/lld/wasm/CMakeLists.txt
++++ b/lld/wasm/CMakeLists.txt
+@@ -9,6 +9,7 @@ add_lld_library(lldWasm
+   LTO.cpp
+   MapFile.cpp
+   MarkLive.cpp
++  OracleJsonl.cpp
+   OutputSections.cpp
+   OutputSegment.cpp
+   Relocations.cpp
+diff --git a/lld/wasm/Config.h b/lld/wasm/Config.h
+index 9d903e0c7..88f134595 100644
+--- a/lld/wasm/Config.h
++++ b/lld/wasm/Config.h
+@@ -74,6 +74,7 @@ struct Config {
+   bool noinhibitExec;
+   bool pie;
+   bool printGcSections;
++  llvm::StringRef gcOracleJsonl;
+   bool relocatable;
+   bool saveTemps;
+   bool shared;
+diff --git a/lld/wasm/Driver.cpp b/lld/wasm/Driver.cpp
+index 1c5d21c06..c1ed27306 100644
+--- a/lld/wasm/Driver.cpp
++++ b/lld/wasm/Driver.cpp
+@@ -11,6 +11,7 @@
+ #include "InputChunks.h"
+ #include "InputElement.h"
+ #include "MarkLive.h"
++#include "OracleJsonl.h"
+ #include "SymbolTable.h"
+ #include "Writer.h"
+ #include "lld/Common/Args.h"
+@@ -590,6 +591,7 @@ static void readConfigs(opt::InputArgList &args) {
+   ctx.arg.pie = args.hasFlag(OPT_pie, OPT_no_pie, false);
+   ctx.arg.printGcSections =
+       args.hasFlag(OPT_print_gc_sections, OPT_no_print_gc_sections, false);
++  ctx.arg.gcOracleJsonl = args.getLastArgValue(OPT_gc_oracle_jsonl);
+   ctx.arg.saveTemps = args.hasArg(OPT_save_temps);
+   ctx.arg.searchPaths = args::getStrings(args, OPT_library_path);
+   ctx.arg.shared = args.hasArg(OPT_shared);
+@@ -848,7 +850,14 @@ static Symbol *handleUndefined(StringRef name, const char *option) {
+   sym->isUsedInRegularObj = true;
+ 
+   if (auto *lazySym = dyn_cast<LazySymbol>(sym)) {
++    std::string symName = sym->getName().str();
++    InputFile *extractedFile = sym->getFile();
++    std::string extractedFileStr = toString(extractedFile);
++    bool willExtract = extractedFile && extractedFile->lazy;
++
+     lazySym->extract();
++    if (willExtract)
++      logExtract(option, extractedFileStr, symName);
+     if (!ctx.arg.whyExtract.empty())
+       ctx.whyExtractRecords.emplace_back(option, sym->getFile(), *sym);
+   }
+@@ -859,9 +868,16 @@ static Symbol *handleUndefined(StringRef name, const char *option) {
+ static void handleLibcall(StringRef name) {
+   Symbol *sym = symtab->find(name);
+   if (sym && sym->isLazy() && isa<BitcodeFile>(sym->getFile())) {
++    std::string symName = sym->getName().str();
++    InputFile *extractedFile = sym->getFile();
++    std::string extractedFileStr = toString(extractedFile);
++    bool willExtract = extractedFile && extractedFile->lazy;
++
+     if (!ctx.arg.whyExtract.empty())
+       ctx.whyExtractRecords.emplace_back("<libcall>", sym->getFile(), *sym);
+     cast<LazySymbol>(sym)->extract();
++    if (willExtract)
++      logExtract("<libcall>", extractedFileStr, symName);
+   }
+ }
+ 
+@@ -1036,10 +1052,18 @@ static void processStubLibrariesPreLTO() {
+             // extracted during processStubLibraries, which is too late since
+             // LTO has already being performed at that point.
+             if (needed->isLazy() && isa<BitcodeFile>(needed->getFile())) {
++              std::string symName = needed->getName().str();
++              InputFile *extractedFile = needed->getFile();
++              std::string extractedFileStr = toString(extractedFile);
++              std::string ref = toString(stub_file);
++              bool willExtract = extractedFile && extractedFile->lazy;
++
+               if (!ctx.arg.whyExtract.empty())
+                 ctx.whyExtractRecords.emplace_back(toString(stub_file),
+                                                    needed->getFile(), *needed);
+               cast<LazySymbol>(needed)->extract();
++              if (willExtract)
++                logExtract(ref, extractedFileStr, symName);
+             }
+           }
+         }
+@@ -1078,8 +1102,18 @@ static bool addStubSymbolDeps(const StubFile *stub_file, Symbol *sym,
+                    << "force export: " << toString(*needed) << "\n");
+       needed->forceExport = true;
+       if (auto *lazy = dyn_cast<LazySymbol>(needed)) {
++        std::string symName = needed->getName().str();
++        InputFile *extractedFile = needed->getFile();
++        std::string extractedFileStr = toString(extractedFile);
++        std::string ref = toString(stub_file);
++        ref += ": import ";
++        ref += sym->getName();
++        bool willExtract = extractedFile && extractedFile->lazy;
++
+         depsAdded = true;
+         lazy->extract();
++        if (willExtract)
++          logExtract(ref, extractedFileStr, symName);
+         if (!ctx.arg.whyExtract.empty())
+           ctx.whyExtractRecords.emplace_back(toString(stub_file),
+                                              sym->getFile(), *sym);
+diff --git a/lld/wasm/MarkLive.cpp b/lld/wasm/MarkLive.cpp
+index 2b2cf19f1..aca2d4319 100644
+--- a/lld/wasm/MarkLive.cpp
++++ b/lld/wasm/MarkLive.cpp
+@@ -24,6 +24,12 @@
+ #include "InputElement.h"
+ #include "SymbolTable.h"
+ #include "Symbols.h"
++#include "lld/Common/ErrorHandler.h"
++#include "llvm/Support/FileSystem.h"
++#include "llvm/Support/JSON.h"
++#include "llvm/Support/raw_ostream.h"
++#include <cstdlib>
++#include <memory>
+ 
+ #define DEBUG_TYPE "lld"
+ 
+@@ -36,9 +42,11 @@ namespace {
+ 
+ class MarkLive {
+ public:
++  explicit MarkLive(raw_ostream *OracleOut) : OracleOut(OracleOut) {}
+   void run();
+ 
+ private:
++  void logRoot(StringRef Reason, const Symbol *Sym);
+   void enqueue(Symbol *sym);
+   void enqueue(InputChunk *chunk);
+   void enqueueInitFunctions(const ObjFile *sym);
+@@ -48,10 +56,24 @@ private:
+ 
+   // A list of chunks to visit.
+   SmallVector<InputChunk *, 256> queue;
++
++  raw_ostream *OracleOut = nullptr;
+ };
+ 
+ } // namespace
+ 
++void MarkLive::logRoot(StringRef Reason, const Symbol *Sym) {
++  if (!OracleOut)
++    return;
++  if (!Sym)
++    return;
++  json::Object O;
++  O["kind"] = "root";
++  O["reason"] = Reason;
++  O["sym"] = Sym->getName();
++  *OracleOut << json::Value(std::move(O)) << "\n";
++}
++
+ void MarkLive::enqueue(Symbol *sym) {
+   if (!sym || sym->isLive())
+     return;
+@@ -106,16 +128,26 @@ void MarkLive::enqueueRetainedSegments(const ObjFile *file) {
+ 
+ void MarkLive::run() {
+   // Add GC root symbols.
+-  if (!ctx.arg.entry.empty())
+-    enqueue(symtab->find(ctx.arg.entry));
++  if (!ctx.arg.entry.empty()) {
++    Symbol *Entry = symtab->find(ctx.arg.entry);
++    logRoot("entry", Entry);
++    enqueue(Entry);
++  }
+ 
+   // We need to preserve any no-strip or exported symbol
+   for (Symbol *sym : symtab->symbols())
+-    if (sym->isNoStrip() || sym->isExported())
++    if (sym->isNoStrip() || sym->isExported()) {
++      if (sym->isExported())
++        logRoot("exported", sym);
++      else
++        logRoot("no_strip", sym);
+       enqueue(sym);
++    }
+ 
+-  if (ctx.sym.callDtors)
++  if (ctx.sym.callDtors) {
++    logRoot("call_dtors", ctx.sym.callDtors);
+     enqueue(ctx.sym.callDtors);
++  }
+ 
+   for (const ObjFile *obj : ctx.objectFiles)
+     if (obj->isLive()) {
+@@ -171,9 +203,134 @@ void markLive() {
+ 
+   LLVM_DEBUG(dbgs() << "markLive\n");
+ 
+-  MarkLive marker;
++  std::unique_ptr<raw_fd_ostream> OracleOut;
++  std::string OraclePath;
++  if (!ctx.arg.gcOracleJsonl.empty())
++    OraclePath = ctx.arg.gcOracleJsonl.str();
++  else if (const char *Env = std::getenv("LLD_GC_ORACLE_JSONL"))
++    OraclePath = Env;
++
++  if (!OraclePath.empty()) {
++    std::error_code EC;
++    OracleOut = std::make_unique<raw_fd_ostream>(
++        OraclePath, EC, sys::fs::OpenFlags::OF_Append);
++    if (EC)
++      fatal("cannot open GC oracle JSONL file: " + OraclePath + ": " +
++            EC.message());
++
++    json::Object H;
++    H["kind"] = "gc_oracle";
++    H["version"] = 1;
++    H["output"] = ctx.arg.outputFile;
++    H["gc_sections"] = ctx.arg.gcSections;
++    H["relocatable"] = ctx.arg.relocatable;
++    H["print_gc_sections"] = ctx.arg.printGcSections;
++    *OracleOut << json::Value(std::move(H)) << "\n";
++  }
++
++  MarkLive marker(OracleOut.get());
+   marker.run();
+ 
++  if (OracleOut) {
++    uint64_t TotalFns = 0, RemovedFns = 0;
++    uint64_t TotalSegs = 0, RemovedSegs = 0;
++    uint64_t TotalGlobals = 0, RemovedGlobals = 0;
++    uint64_t TotalTags = 0, RemovedTags = 0;
++    uint64_t TotalTables = 0, RemovedTables = 0;
++    uint64_t TotalSynthFns = 0, RemovedSynthFns = 0;
++    uint64_t TotalSynthGlobals = 0, RemovedSynthGlobals = 0;
++    uint64_t TotalSynthTables = 0, RemovedSynthTables = 0;
++
++    auto emitRemoved = [&](StringRef ChunkKind, StringRef ChunkStr) {
++      json::Object O;
++      O["kind"] = "removed";
++      O["chunk_kind"] = ChunkKind;
++      O["chunk"] = ChunkStr;
++      *OracleOut << json::Value(std::move(O)) << "\n";
++    };
++
++    for (const ObjFile *obj : ctx.objectFiles) {
++      for (InputChunk *c : obj->functions) {
++        ++TotalFns;
++        if (!c->live) {
++          ++RemovedFns;
++          emitRemoved("function", toString(c));
++        }
++      }
++      for (InputChunk *c : obj->segments) {
++        ++TotalSegs;
++        if (!c->live) {
++          ++RemovedSegs;
++          emitRemoved("segment", toString(c));
++        }
++      }
++      for (InputGlobal *g : obj->globals) {
++        ++TotalGlobals;
++        if (!g->live) {
++          ++RemovedGlobals;
++          emitRemoved("global", toString(g));
++        }
++      }
++      for (InputTag *t : obj->tags) {
++        ++TotalTags;
++        if (!t->live) {
++          ++RemovedTags;
++          emitRemoved("tag", toString(t));
++        }
++      }
++      for (InputTable *t : obj->tables) {
++        ++TotalTables;
++        if (!t->live) {
++          ++RemovedTables;
++          emitRemoved("table", toString(t));
++        }
++      }
++    }
++    for (InputChunk *c : ctx.syntheticFunctions) {
++      ++TotalSynthFns;
++      if (!c->live) {
++        ++RemovedSynthFns;
++        emitRemoved("synthetic_function", toString(c));
++      }
++    }
++    for (InputGlobal *g : ctx.syntheticGlobals) {
++      ++TotalSynthGlobals;
++      if (!g->live) {
++        ++RemovedSynthGlobals;
++        emitRemoved("synthetic_global", toString(g));
++      }
++    }
++    for (InputTable *t : ctx.syntheticTables) {
++      ++TotalSynthTables;
++      if (!t->live) {
++        ++RemovedSynthTables;
++        emitRemoved("synthetic_table", toString(t));
++      }
++    }
++
++    json::Object S;
++    S["kind"] = "summary";
++    S["objects"] = int64_t(ctx.objectFiles.size());
++    S["total_functions"] = int64_t(TotalFns);
++    S["removed_functions"] = int64_t(RemovedFns);
++    S["total_segments"] = int64_t(TotalSegs);
++    S["removed_segments"] = int64_t(RemovedSegs);
++    S["total_globals"] = int64_t(TotalGlobals);
++    S["removed_globals"] = int64_t(RemovedGlobals);
++    S["total_tags"] = int64_t(TotalTags);
++    S["removed_tags"] = int64_t(RemovedTags);
++    S["total_tables"] = int64_t(TotalTables);
++    S["removed_tables"] = int64_t(RemovedTables);
++    S["total_synth_functions"] = int64_t(TotalSynthFns);
++    S["removed_synth_functions"] = int64_t(RemovedSynthFns);
++    S["total_synth_globals"] = int64_t(TotalSynthGlobals);
++    S["removed_synth_globals"] = int64_t(RemovedSynthGlobals);
++    S["total_synth_tables"] = int64_t(TotalSynthTables);
++    S["removed_synth_tables"] = int64_t(RemovedSynthTables);
++    *OracleOut << json::Value(std::move(S)) << "\n";
++    OracleOut->flush();
++  }
++
+   // Report garbage-collected sections.
+   if (ctx.arg.printGcSections) {
+     for (const ObjFile *obj : ctx.objectFiles) {
+diff --git a/lld/wasm/Options.td b/lld/wasm/Options.td
+index 2f699e2f6..060d29c97 100644
+--- a/lld/wasm/Options.td
++++ b/lld/wasm/Options.td
+@@ -125,6 +125,10 @@ defm print_gc_sections: B<"print-gc-sections",
+     "List removed unused sections",
+     "Do not list removed unused sections (default)">;
+ 
++def gc_oracle_jsonl: JJ<"gc-oracle-jsonl=">,
++  HelpText<"Write GC live/dead decisions as JSONL to <path>">,
++  MetaVarName<"<path>">;
++
+ def print_map: F<"print-map">,
+   HelpText<"Print a link map to the standard output">;
+ 
+diff --git a/lld/wasm/SymbolTable.cpp b/lld/wasm/SymbolTable.cpp
+index 91677b34e..04d3530e9 100644
+--- a/lld/wasm/SymbolTable.cpp
++++ b/lld/wasm/SymbolTable.cpp
+@@ -10,6 +10,7 @@
+ #include "Config.h"
+ #include "InputChunks.h"
+ #include "InputElement.h"
++#include "OracleJsonl.h"
+ #include "WriterUtils.h"
+ #include "lld/Common/CommonLinkerContext.h"
+ #include <optional>
+@@ -644,7 +645,15 @@ Symbol *SymbolTable::addUndefinedFunction(StringRef name,
+       lazy->setWeak();
+       lazy->signature = sig;
+     } else {
++      std::string symName = s->getName().str();
++      InputFile *extractedFile = s->getFile();
++      std::string extractedFileStr = toString(extractedFile);
++      std::string ref = file ? toString(file) : std::string("<internal>");
++      bool willExtract = extractedFile && extractedFile->lazy;
++
+       lazy->extract();
++      if (willExtract)
++        logExtract(ref, extractedFileStr, symName);
+       if (!ctx.arg.whyExtract.empty())
+         ctx.whyExtractRecords.emplace_back(toString(file), s->getFile(), *s);
+     }
+@@ -703,8 +712,17 @@ Symbol *SymbolTable::addUndefinedData(StringRef name, uint32_t flags,
+   } else if (auto *lazy = dyn_cast<LazySymbol>(s)) {
+     if ((flags & WASM_SYMBOL_BINDING_MASK) == WASM_SYMBOL_BINDING_WEAK)
+       lazy->setWeak();
+-    else
++    else {
++      std::string symName = s->getName().str();
++      InputFile *extractedFile = s->getFile();
++      std::string extractedFileStr = toString(extractedFile);
++      std::string ref = file ? toString(file) : std::string("<internal>");
++      bool willExtract = extractedFile && extractedFile->lazy;
++
+       lazy->extract();
++      if (willExtract)
++        logExtract(ref, extractedFileStr, symName);
++    }
+   } else if (s->isDefined()) {
+     checkDataType(s, file);
+   } else if (s->isWeak()) {
+@@ -730,8 +748,17 @@ Symbol *SymbolTable::addUndefinedGlobal(StringRef name,
+   if (wasInserted)
+     replaceSymbol<UndefinedGlobal>(s, name, importName, importModule, flags,
+                                    file, type);
+-  else if (auto *lazy = dyn_cast<LazySymbol>(s))
++  else if (auto *lazy = dyn_cast<LazySymbol>(s)) {
++    std::string symName = s->getName().str();
++    InputFile *extractedFile = s->getFile();
++    std::string extractedFileStr = toString(extractedFile);
++    std::string ref = file ? toString(file) : std::string("<internal>");
++    bool willExtract = extractedFile && extractedFile->lazy;
++
+     lazy->extract();
++    if (willExtract)
++      logExtract(ref, extractedFileStr, symName);
++  }
+   else if (s->isDefined())
+     checkGlobalType(s, file, type);
+   else if (s->isWeak())
+@@ -756,8 +783,17 @@ Symbol *SymbolTable::addUndefinedTable(StringRef name,
+   if (wasInserted)
+     replaceSymbol<UndefinedTable>(s, name, importName, importModule, flags,
+                                   file, type);
+-  else if (auto *lazy = dyn_cast<LazySymbol>(s))
++  else if (auto *lazy = dyn_cast<LazySymbol>(s)) {
++    std::string symName = s->getName().str();
++    InputFile *extractedFile = s->getFile();
++    std::string extractedFileStr = toString(extractedFile);
++    std::string ref = file ? toString(file) : std::string("<internal>");
++    bool willExtract = extractedFile && extractedFile->lazy;
++
+     lazy->extract();
++    if (willExtract)
++      logExtract(ref, extractedFileStr, symName);
++  }
+   else if (s->isDefined())
+     checkTableType(s, file, type);
+   else if (s->isWeak())
+@@ -782,8 +818,17 @@ Symbol *SymbolTable::addUndefinedTag(StringRef name,
+   if (wasInserted)
+     replaceSymbol<UndefinedTag>(s, name, importName, importModule, flags, file,
+                                 sig);
+-  else if (auto *lazy = dyn_cast<LazySymbol>(s))
++  else if (auto *lazy = dyn_cast<LazySymbol>(s)) {
++    std::string symName = s->getName().str();
++    InputFile *extractedFile = s->getFile();
++    std::string extractedFileStr = toString(extractedFile);
++    std::string ref = file ? toString(file) : std::string("<internal>");
++    bool willExtract = extractedFile && extractedFile->lazy;
++
+     lazy->extract();
++    if (willExtract)
++      logExtract(ref, extractedFileStr, symName);
++  }
+   else if (s->isDefined())
+     checkTagType(s, file, sig);
+   else if (s->isWeak())
+@@ -892,7 +937,12 @@ void SymbolTable::addLazy(StringRef name, InputFile *file) {
+ 
+   LLVM_DEBUG(dbgs() << "replacing existing undefined\n");
+   const InputFile *oldFile = s->getFile();
++  std::string ref = oldFile ? toString(oldFile) : std::string("<internal>");
++  bool willExtract = file && file->lazy;
++  std::string extractedFileStr = toString(file);
+   LazySymbol(name, 0, file).extract();
++  if (willExtract)
++    logExtract(ref, extractedFileStr, name);
+   if (!ctx.arg.whyExtract.empty())
+     ctx.whyExtractRecords.emplace_back(toString(oldFile), s->getFile(), *s);
+ }

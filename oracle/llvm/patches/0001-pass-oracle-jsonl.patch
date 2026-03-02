@@ -42,7 +42,7 @@ index 4ee5ab255..fc2db1fc5 100644
    PrintPassInstrumentation PrintPass;
    TimePassesHandler TimePasses;
 diff --git a/llvm/lib/Passes/StandardInstrumentations.cpp b/llvm/lib/Passes/StandardInstrumentations.cpp
-index 0623e6677..53b5adb40 100644
+index 0623e6677..30fea9a0a 100644
 --- a/llvm/lib/Passes/StandardInstrumentations.cpp
 +++ b/llvm/lib/Passes/StandardInstrumentations.cpp
 @@ -14,7 +14,9 @@
@@ -97,7 +97,7 @@ index 0623e6677..53b5adb40 100644
  template <typename IRUnitT> static const IRUnitT *unwrapIR(Any IR) {
    const IRUnitT **IRPtr = llvm::any_cast<const IRUnitT *>(&IR);
    return IRPtr ? *IRPtr : nullptr;
-@@ -2434,6 +2448,434 @@ void DotCfgChangeReporter::registerCallbacks(
+@@ -2434,6 +2448,562 @@ void DotCfgChangeReporter::registerCallbacks(
    }
  }
  
@@ -133,6 +133,16 @@ index 0623e6677..53b5adb40 100644
 +  uint64_t DbgLocUnique = 0;
 +
 +  DenseMap<const DILocation *, PassOracleLocCounts> Locs;
++};
++
++struct PassOracleLocCounts64 {
++  uint64_t Inst = 0;
++  uint64_t Call = 0;
++  uint64_t Br = 0;
++  uint64_t ConstOp = 0;
++  uint64_t Alloca = 0;
++  uint64_t Load = 0;
++  uint64_t Store = 0;
 +};
 +
 +static uint32_t countConstOperands(const Instruction &I) {
@@ -176,6 +186,7 @@ index 0623e6677..53b5adb40 100644
 +  std::mutex Mu;
 +  std::unique_ptr<raw_fd_ostream> Out;
 +  SmallVector<StackEntry, 8> Stack;
++  bool EmittedInputLocStats = false;
 +
 +  void ensureOpen() {
 +    if (Out)
@@ -290,6 +301,116 @@ index 0623e6677..53b5adb40 100644
 +  }
 +
 +  static bool shouldIgnorePass(StringRef PassID) { return isIgnored(PassID); }
++
++  void emitInputIRLocStats(const Module &M) {
++    // Aggregate strict !dbg locations across the whole module.
++    DenseMap<const DILocation *, PassOracleLocCounts64> Locs;
++    PassOracleLocCounts64 Totals;
++
++    for (const Function &F : M.functions()) {
++      if (!shouldTrackFunction(F))
++        continue;
++      for (const BasicBlock &BB : F) {
++        for (const Instruction &I : BB) {
++          DebugLoc DL = I.getDebugLoc();
++          if (!DL)
++            continue;
++          const DILocation *Loc = DL.get();
++          if (!Loc)
++            continue;
++
++          const bool IsCall = isa<CallBase>(&I);
++          const bool IsBr = isBranchLike(I);
++          const bool IsAlloca = isa<AllocaInst>(&I);
++          const bool IsLoad = isa<LoadInst>(&I);
++          const bool IsStore = isa<StoreInst>(&I);
++          const uint32_t ConstOps = countConstOperands(I);
++
++          PassOracleLocCounts64 &C = Locs[Loc];
++          ++C.Inst;
++          if (IsCall)
++            ++C.Call;
++          if (IsBr)
++            ++C.Br;
++          if (IsAlloca)
++            ++C.Alloca;
++          if (IsLoad)
++            ++C.Load;
++          if (IsStore)
++            ++C.Store;
++          C.ConstOp += ConstOps;
++
++          ++Totals.Inst;
++          if (IsCall)
++            ++Totals.Call;
++          if (IsBr)
++            ++Totals.Br;
++          if (IsAlloca)
++            ++Totals.Alloca;
++          if (IsLoad)
++            ++Totals.Load;
++          if (IsStore)
++            ++Totals.Store;
++          Totals.ConstOp += ConstOps;
++        }
++      }
++    }
++
++    json::Object R;
++    R["kind"] = "ir_loc_stats";
++    R["module"] = M.getModuleIdentifier();
++    json::Object S;
++    S["inst"] = Totals.Inst;
++    S["call"] = Totals.Call;
++    S["br"] = Totals.Br;
++    S["const_op"] = Totals.ConstOp;
++    S["alloca"] = Totals.Alloca;
++    S["load"] = Totals.Load;
++    S["store"] = Totals.Store;
++    R["summary"] = std::move(S);
++
++    SmallVector<const DILocation *, 256> Keys;
++    Keys.reserve(Locs.size());
++    for (const auto &KV : Locs)
++      Keys.push_back(KV.first);
++
++    llvm::sort(Keys, [](const DILocation *A, const DILocation *B) {
++      // Stable (enough) ordering: file path, then line, then col.
++      const std::string FA = filePathForLoc(*A);
++      const std::string FB = filePathForLoc(*B);
++      if (FA != FB)
++        return FA < FB;
++      if (A->getLine() != B->getLine())
++        return A->getLine() < B->getLine();
++      return A->getColumn() < B->getColumn();
++    });
++
++    json::Array A;
++    A.reserve(Keys.size());
++    for (const DILocation *Loc : Keys) {
++      auto It = Locs.find(Loc);
++      if (It == Locs.end())
++        continue;
++      const PassOracleLocCounts64 &C = It->second;
++      json::Object L;
++      L["file"] = filePathForLoc(*Loc);
++      L["line"] = int64_t(Loc->getLine());
++      L["col"] = int64_t(Loc->getColumn());
++      L["inst"] = C.Inst;
++      L["call"] = C.Call;
++      L["br"] = C.Br;
++      L["const_op"] = C.ConstOp;
++      L["alloca"] = C.Alloca;
++      L["load"] = C.Load;
++      L["store"] = C.Store;
++      A.push_back(std::move(L));
++    }
++    R["loc_counts"] = std::move(A);
++
++    std::lock_guard<std::mutex> Lock(Mu);
++    ensureOpen();
++    *Out << json::Value(std::move(R)) << "\n";
++  }
 +
 +  void collectFunctions(Any IR, SmallVector<const Function *, 8> &Funcs) const {
 +    if (const auto *M = unwrapIR<Module>(IR)) {
@@ -439,6 +560,13 @@ index 0623e6677..53b5adb40 100644
 +    E.PassName = PassName.str();
 +    E.IRName = getIRName(IR);
 +
++    if (!EmittedInputLocStats) {
++      if (const Module *M = unwrapModule(IR, /*Force=*/true)) {
++        emitInputIRLocStats(*M);
++        EmittedInputLocStats = true;
++      }
++    }
++
 +    if (shouldIgnorePass(PassID)) {
 +      Stack.push_back(std::move(E));
 +      return;
@@ -532,7 +660,7 @@ index 0623e6677..53b5adb40 100644
  StandardInstrumentations::StandardInstrumentations(
      LLVMContext &Context, bool DebugLogging, bool VerifyEach,
      PrintPassOptions PrintPassOpts)
-@@ -2508,6 +2950,7 @@ void PrintCrashIRInstrumentation::registerCallbacks(
+@@ -2508,6 +3078,7 @@ void PrintCrashIRInstrumentation::registerCallbacks(
  
  void StandardInstrumentations::registerCallbacks(
      PassInstrumentationCallbacks &PIC, ModuleAnalysisManager *MAM) {

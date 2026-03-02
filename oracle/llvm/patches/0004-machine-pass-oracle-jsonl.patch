@@ -1,0 +1,396 @@
+diff --git a/llvm/lib/CodeGen/MachineFunctionPass.cpp b/llvm/lib/CodeGen/MachineFunctionPass.cpp
+index a66987798..86b17b774 100644
+--- a/llvm/lib/CodeGen/MachineFunctionPass.cpp
++++ b/llvm/lib/CodeGen/MachineFunctionPass.cpp
+@@ -10,6 +10,8 @@
+ //
+ //===----------------------------------------------------------------------===//
+ 
++#include "llvm/ADT/DenseMap.h"
++#include "llvm/ADT/DenseSet.h"
+ #include "llvm/CodeGen/MachineFunctionPass.h"
+ #include "llvm/Analysis/BasicAliasAnalysis.h"
+ #include "llvm/Analysis/DominanceFrontier.h"
+@@ -25,10 +27,17 @@
+ #include "llvm/CodeGen/MachineModuleInfo.h"
+ #include "llvm/CodeGen/MachineOptimizationRemarkEmitter.h"
+ #include "llvm/CodeGen/Passes.h"
++#include "llvm/IR/DebugInfoMetadata.h"
+ #include "llvm/IR/Dominators.h"
+ #include "llvm/IR/Function.h"
+ #include "llvm/IR/Module.h"
+ #include "llvm/IR/PrintPasses.h"
++#include "llvm/Support/FileSystem.h"
++#include "llvm/Support/JSON.h"
++#include "llvm/Support/Path.h"
++#include "llvm/Target/TargetMachine.h"
++#include <cstdlib>
++#include <mutex>
+ 
+ using namespace llvm;
+ using namespace ore;
+@@ -38,6 +47,311 @@ static cl::opt<bool> DroppedVarStatsMIR(
+     cl::desc("Dump dropped debug variables stats for MIR passes"),
+     cl::init(false));
+ 
++// Machine-pass oracle: structured per-pass MachineFunction deltas (JSONL).
++//
++// This is intended as a backend-level "ironclad" oracle to explain binary-side
++// line table deltas that are not visible in IR-level pass oracles.
++static cl::opt<std::string> MachinePassOraclePath(
++    "machine-pass-oracle", cl::Hidden,
++    cl::desc("Write machine pass-level change summaries as JSONL to this path"),
++    cl::init(""), cl::value_desc("filename"));
++
++namespace {
++
++struct MachineOracleLocCounts {
++  uint32_t Inst = 0;
++  uint32_t Call = 0;
++  uint32_t Br = 0;
++  uint32_t ConstOp = 0;
++  uint32_t Alloca = 0;
++  uint32_t Load = 0;
++  uint32_t Store = 0;
++
++  bool operator==(const MachineOracleLocCounts &O) const {
++    return Inst == O.Inst && Call == O.Call && Br == O.Br &&
++           ConstOp == O.ConstOp && Alloca == O.Alloca && Load == O.Load &&
++           Store == O.Store;
++  }
++  bool operator!=(const MachineOracleLocCounts &O) const {
++    return !(*this == O);
++  }
++};
++
++struct MachineOracleFuncSummary {
++  uint64_t Inst = 0;
++  uint64_t Call = 0;
++  uint64_t Br = 0;
++  uint64_t ConstOp = 0;
++  uint64_t Alloca = 0;
++  uint64_t Load = 0;
++  uint64_t Store = 0;
++  uint64_t DbgLocInst = 0;
++  uint64_t DbgLocUnique = 0;
++
++  DenseMap<const DILocation *, MachineOracleLocCounts> Locs;
++};
++
++static uint32_t countConstOperands(const MachineInstr &MI) {
++  uint32_t C = 0;
++  for (const MachineOperand &MO : MI.operands()) {
++    if (MO.isImm() || MO.isFPImm())
++      ++C;
++  }
++  return C;
++}
++
++static std::string filePathForLoc(const DILocation &Loc) {
++  const DIFile *F = Loc.getFile();
++  if (!F)
++    return "";
++  SmallString<256> P(F->getDirectory());
++  sys::path::append(P, F->getFilename());
++  return std::string(P);
++}
++
++static MachineOracleFuncSummary summarizeMachineFunction(const MachineFunction &MF) {
++  MachineOracleFuncSummary S;
++  DenseSet<const DILocation *> UniqueLocs;
++  const DILocation *ActiveLoc = nullptr;
++
++  for (const MachineBasicBlock &MBB : MF) {
++    for (const MachineInstr &MI : MBB) {
++      // Debug-only pseudo instructions don't generate code and would pollute
++      // binary-side correlation (they don't show up in wasm text).
++      if (MI.isDebugInstr())
++        continue;
++
++      ++S.Inst;
++      const bool IsCall = MI.isCall();
++      const bool IsBr = MI.isBranch();
++      const bool IsLoad = MI.mayLoad();
++      const bool IsStore = MI.mayStore();
++      const uint32_t ConstOps = countConstOperands(MI);
++
++      if (IsCall)
++        ++S.Call;
++      if (IsBr)
++        ++S.Br;
++      if (IsLoad)
++        ++S.Load;
++      if (IsStore)
++        ++S.Store;
++      S.ConstOp += ConstOps;
++
++      const DILocation *StrictLoc = nullptr;
++      if (DebugLoc DL = MI.getDebugLoc()) {
++        ++S.DbgLocInst;
++        StrictLoc = DL.get();
++        ActiveLoc = StrictLoc;
++        UniqueLocs.insert(StrictLoc);
++      }
++
++      // Mirror how debug line tables attribute machine instructions: if an
++      // instruction doesn't carry an explicit DebugLoc, it is emitted at the
++      // last active location (sticky state machine). This matches what
++      // wasm-tools addr2line sees from the final binary.
++      const DILocation *EffectiveLoc = StrictLoc ? StrictLoc : ActiveLoc;
++
++      if (EffectiveLoc) {
++        MachineOracleLocCounts &LC = S.Locs[EffectiveLoc];
++        ++LC.Inst;
++        if (IsCall)
++          ++LC.Call;
++        if (IsBr)
++          ++LC.Br;
++        if (IsLoad)
++          ++LC.Load;
++        if (IsStore)
++          ++LC.Store;
++        LC.ConstOp += ConstOps;
++      }
++    }
++  }
++
++  S.DbgLocUnique = UniqueLocs.size();
++  return S;
++}
++
++static bool isUnchanged(const MachineOracleFuncSummary &A,
++                        const MachineOracleFuncSummary &B) {
++  if (A.Inst != B.Inst || A.Call != B.Call || A.Br != B.Br ||
++      A.ConstOp != B.ConstOp || A.Alloca != B.Alloca || A.Load != B.Load ||
++      A.Store != B.Store || A.DbgLocInst != B.DbgLocInst ||
++      A.DbgLocUnique != B.DbgLocUnique)
++    return false;
++
++  if (A.Locs.size() != B.Locs.size())
++    return false;
++
++  for (const auto &KV : A.Locs) {
++    const DILocation *Loc = KV.first;
++    auto It = B.Locs.find(Loc);
++    if (It == B.Locs.end())
++      return false;
++    if (KV.second != It->second)
++      return false;
++  }
++  return true;
++}
++
++static std::string getOraclePath() {
++  if (!MachinePassOraclePath.empty())
++    return MachinePassOraclePath;
++  if (const char *Env = std::getenv("LLVM_MACHINE_PASS_ORACLE_JSONL"))
++    return std::string(Env);
++  return "";
++}
++
++struct MachinePassOracleState {
++  std::mutex Mu;
++  std::unique_ptr<raw_fd_ostream> Out;
++  DenseMap<const MachineFunction *, MachineOracleFuncSummary> Last;
++  bool HeaderEmitted = false;
++};
++
++static MachinePassOracleState &oracleState() {
++  static MachinePassOracleState S;
++  return S;
++}
++
++static void ensureOpen(MachinePassOracleState &S, StringRef Path,
++                       const MachineFunction &MF) {
++  if (S.Out)
++    return;
++  std::error_code EC;
++  S.Out = std::make_unique<raw_fd_ostream>(Path, EC,
++                                           sys::fs::OpenFlags::OF_Append);
++  if (EC)
++    report_fatal_error(errorCodeToError(EC));
++
++  if (!S.HeaderEmitted) {
++    json::Object H;
++    H["kind"] = "machine_pass_oracle_header";
++    H["version"] = 1;
++    H["triple"] = MF.getTarget().getTargetTriple().str();
++    H["cpu"] = MF.getTarget().getTargetCPU();
++    H["features"] = MF.getTarget().getTargetFeatureString();
++    *S.Out << json::Value(std::move(H)) << "\n";
++    S.HeaderEmitted = true;
++  }
++}
++
++static void emitMachinePassRecord(raw_ostream &OS, const MachineFunction &MF,
++                                  StringRef PassName, StringRef PassID,
++                                  const MachineOracleFuncSummary &Before,
++                                  const MachineOracleFuncSummary &After) {
++  json::Object O;
++  O["kind"] = "machine_pass_oracle";
++  O["function"] = MF.getName();
++  O["module"] = MF.getFunction().getParent()->getName();
++  O["pass_name"] = PassName;
++  O["pass_id"] = PassID;
++
++  auto toSummary = [](const MachineOracleFuncSummary &S) -> json::Object {
++    json::Object J;
++    J["inst"] = static_cast<int64_t>(S.Inst);
++    J["call"] = static_cast<int64_t>(S.Call);
++    J["br"] = static_cast<int64_t>(S.Br);
++    J["const_op"] = static_cast<int64_t>(S.ConstOp);
++    J["alloca"] = static_cast<int64_t>(S.Alloca);
++    J["load"] = static_cast<int64_t>(S.Load);
++    J["store"] = static_cast<int64_t>(S.Store);
++    J["dbg_loc_inst"] = static_cast<int64_t>(S.DbgLocInst);
++    J["dbg_loc_unique"] = static_cast<int64_t>(S.DbgLocUnique);
++    return J;
++  };
++
++  auto toDelta = [](const MachineOracleFuncSummary &A,
++                    const MachineOracleFuncSummary &B) -> json::Object {
++    json::Object D;
++    D["inst"] = static_cast<int64_t>(B.Inst) - static_cast<int64_t>(A.Inst);
++    D["call"] = static_cast<int64_t>(B.Call) - static_cast<int64_t>(A.Call);
++    D["br"] = static_cast<int64_t>(B.Br) - static_cast<int64_t>(A.Br);
++    D["const_op"] =
++        static_cast<int64_t>(B.ConstOp) - static_cast<int64_t>(A.ConstOp);
++    D["alloca"] =
++        static_cast<int64_t>(B.Alloca) - static_cast<int64_t>(A.Alloca);
++    D["load"] = static_cast<int64_t>(B.Load) - static_cast<int64_t>(A.Load);
++    D["store"] = static_cast<int64_t>(B.Store) - static_cast<int64_t>(A.Store);
++    D["dbg_loc_inst"] =
++        static_cast<int64_t>(B.DbgLocInst) - static_cast<int64_t>(A.DbgLocInst);
++    D["dbg_loc_unique"] = static_cast<int64_t>(B.DbgLocUnique) -
++                          static_cast<int64_t>(A.DbgLocUnique);
++    return D;
++  };
++
++  O["before"] = toSummary(Before);
++  O["after"] = toSummary(After);
++  O["delta"] = toDelta(Before, After);
++
++  json::Array LocDeltas;
++  DenseSet<const DILocation *> Seen;
++  auto emitLoc = [&](const DILocation *Loc, const MachineOracleLocCounts &A,
++                     const MachineOracleLocCounts &B) {
++    if (!Loc)
++      return;
++    const std::string File = filePathForLoc(*Loc);
++    if (File.empty())
++      return;
++
++    const int64_t DInst =
++        static_cast<int64_t>(B.Inst) - static_cast<int64_t>(A.Inst);
++    const int64_t DCall =
++        static_cast<int64_t>(B.Call) - static_cast<int64_t>(A.Call);
++    const int64_t DBr =
++        static_cast<int64_t>(B.Br) - static_cast<int64_t>(A.Br);
++    const int64_t DConstOp =
++        static_cast<int64_t>(B.ConstOp) - static_cast<int64_t>(A.ConstOp);
++    const int64_t DAlloca =
++        static_cast<int64_t>(B.Alloca) - static_cast<int64_t>(A.Alloca);
++    const int64_t DLoad =
++        static_cast<int64_t>(B.Load) - static_cast<int64_t>(A.Load);
++    const int64_t DStore =
++        static_cast<int64_t>(B.Store) - static_cast<int64_t>(A.Store);
++
++    if (DInst == 0 && DCall == 0 && DBr == 0 && DConstOp == 0 &&
++        DAlloca == 0 && DLoad == 0 && DStore == 0)
++      return;
++
++    json::Object LD;
++    LD["file"] = File;
++    LD["line"] = static_cast<int64_t>(Loc->getLine());
++    LD["col"] = static_cast<int64_t>(Loc->getColumn());
++    LD["d_inst"] = DInst;
++    LD["d_call"] = DCall;
++    LD["d_br"] = DBr;
++    LD["d_const_op"] = DConstOp;
++    LD["d_alloca"] = DAlloca;
++    LD["d_load"] = DLoad;
++    LD["d_store"] = DStore;
++    LocDeltas.push_back(std::move(LD));
++  };
++
++  for (const auto &KV : After.Locs) {
++    const DILocation *Loc = KV.first;
++    const MachineOracleLocCounts &B = KV.second;
++    MachineOracleLocCounts A;
++    if (auto It = Before.Locs.find(Loc); It != Before.Locs.end())
++      A = It->second;
++    if (A != B)
++      emitLoc(Loc, A, B);
++    Seen.insert(Loc);
++  }
++  for (const auto &KV : Before.Locs) {
++    const DILocation *Loc = KV.first;
++    if (Seen.contains(Loc))
++      continue;
++    const MachineOracleLocCounts &A = KV.second;
++    MachineOracleLocCounts B;
++    emitLoc(Loc, A, B);
++  }
++
++  O["loc_deltas"] = std::move(LocDeltas);
++  OS << json::Value(std::move(O)) << "\n";
++}
++
++} // namespace
++
+ Pass *MachineFunctionPass::createPrinterPass(raw_ostream &O,
+                                              const std::string &Banner) const {
+   return createMachineFunctionPrinterPass(O, Banner);
+@@ -97,6 +411,29 @@ bool MachineFunctionPass::runOnFunction(Function &F) {
+ 
+   MFProps.reset(ClearedProperties);
+ 
++  StringRef OraclePassID;
++  if (const PassInfo *PI = Pass::lookupPassInfo(getPassID()))
++    OraclePassID = PI->getPassArgument();
++
++  const std::string OraclePath = getOraclePath();
++  const bool EmitMachineOracle = !OraclePath.empty();
++  MachineOracleFuncSummary OracleBefore;
++  if (EmitMachineOracle) {
++    bool HaveBefore = false;
++    {
++      MachinePassOracleState &S = oracleState();
++      std::lock_guard<std::mutex> Lock(S.Mu);
++      auto It = S.Last.find(&MF);
++      if (It != S.Last.end()) {
++        OracleBefore = std::move(It->second);
++        S.Last.erase(It);
++        HaveBefore = true;
++      }
++    }
++    if (!HaveBefore)
++      OracleBefore = summarizeMachineFunction(MF);
++  }
++
+   bool RV;
+   if (DroppedVarStatsMIR) {
+     DroppedVariableStatsMIR DroppedVarStatsMF;
+@@ -108,6 +445,22 @@ bool MachineFunctionPass::runOnFunction(Function &F) {
+     RV = runOnMachineFunction(MF);
+   }
+ 
++  if (EmitMachineOracle) {
++    MachineOracleFuncSummary OracleAfter = summarizeMachineFunction(MF);
++    if (!isUnchanged(OracleBefore, OracleAfter)) {
++      MachinePassOracleState &S = oracleState();
++      std::lock_guard<std::mutex> Lock(S.Mu);
++      ensureOpen(S, OraclePath, MF);
++      emitMachinePassRecord(*S.Out, MF, getPassName(), OraclePassID, OracleBefore,
++                            OracleAfter);
++    }
++    {
++      MachinePassOracleState &S = oracleState();
++      std::lock_guard<std::mutex> Lock(S.Mu);
++      S.Last[&MF] = std::move(OracleAfter);
++    }
++  }
++
+   if (ShouldEmitSizeRemarks) {
+     // We wanted size remarks. Check if there was a change to the number of
+     // MachineInstrs in the module. Emit a remark if there was a change.
